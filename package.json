@@ -1,0 +1,16 @@
+{
+  "name": "illusion-of-correctness",
+  "version": "0.1.0",
+  "description": "Find the defects that survive a green test suite: gates that fail open, tests that measure their own copy, background writes that never land.",
+  "keywords": ["static-analysis","code-review","ai-generated-code","llm","fail-open","security","testing","tautological-tests","serverless","code-quality"],
+  "license": "MIT",
+  "type": "module",
+  "bin": { "illusion": "bin/illusion.mjs" },
+  "exports": { ".": "./src/rules.mjs" },
+  "files": ["bin/","src/","README.md","SECURITY.md","LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "repository": { "type": "git", "url": "git+https://github.com/Frans-Tech-Sight/illusion-of-correctness.git" },
+  "bugs": { "url": "https://github.com/Frans-Tech-Sight/illusion-of-correctness/issues" },
+  "dependencies": {}
+}
