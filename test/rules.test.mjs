@@ -93,11 +93,22 @@ function checkBalance(p) { return p.balance > 0; }`;
   assert.ok(rules('test/organisations.test.ts', src).includes('TAUTOLOGY'));
 });
 
-test('TAUTOLOGY: test that defines the very function it describes', () => {
+test('TAUTOLOGY: test that defines the very function it describes AND asserts on it', () => {
+  const src = `
+function computeVerdict(p) { return p.ok; }
+describe('computeVerdict', () => { it('works', () => { expect(computeVerdict({ok:1})).toBe(1); }); });`;
+  assert.ok(rules('test/verdict.test.mjs', src).includes('TAUTOLOGY'));
+});
+
+// CONTRACT CHANGE, 0.3.0 (deliberate, not a regression): a local function that is
+// described but never ASSERTED ON is no longer TAUTOLOGY. It is a vacuous test —
+// a different defect — and treating it as a tautology is what flagged React
+// fixture components across five monorepos.
+test('TAUTOLOGY: described but never asserted on is NOT flagged (vacuous, not tautological)', () => {
   const src = `
 function computeVerdict(p) { return p.ok; }
 describe('computeVerdict', () => { it('works', () => {}); });`;
-  assert.ok(rules('test/verdict.test.mjs', src).includes('TAUTOLOGY'));
+  assert.ok(!rules('test/verdict.test.mjs', src).includes('TAUTOLOGY'));
 });
 
 test('TAUTOLOGY: importing the real implementation is NOT flagged', () => {
@@ -269,4 +280,89 @@ test('TAUTOLOGY: a mirror confession in a COMMENT still fires after string-strip
   const src = `// mirrors generateSignature() in payfast.ts — keep in lockstep
 function generateSignature(d) { return md5(d); }`;
   assert.ok(rules('test/payfast.test.ts', src).includes('TAUTOLOGY'));
+});
+
+// ── TAUTOLOGY precision, 0.3.0 (2026-08-28 monorepo sweep) ───────────────────
+// 12 findings across 5 monorepos, all false positives. A local definition is a
+// tautology only when the suite ASSERTS ON IT while naming it as the subject.
+
+test('TAUTOLOGY: React fixture component is NOT flagged', () => {
+  // react-router __tests__/useNavigate-test.tsx shape. Rendered, never asserted on.
+  const src = `import { useNavigate } from "react-router";
+describe('useNavigate', () => {
+  function Parent() { return <Child />; }
+  function Child() { return null; }
+  it('navigates', () => { expect(screen.getByText('x')).toBeTruthy(); });
+});`;
+  assert.ok(!rules('packages/react-router/__tests__/useNavigate-test.tsx', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: a test helper that IS asserted on but is not the subject is NOT flagged', () => {
+  const src = `import { z } from "zod";
+function bundle(entry) { return build(entry); }
+describe('tree shaking', () => {
+  it('is small', async () => { expect(await bundle('a')).toBeLessThan(100); });
+});`;
+  assert.ok(!rules('packages/treeshake/bundle-size.test.ts', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: local copy that IS the subject and IS asserted on IS flagged', () => {
+  // The real STB03 shape: the suite says it tests engineLabel, and asserts
+  // against its own copy rather than the shipped one.
+  const src = `import { describe, it, expect } from 'vitest';
+function engineLabel(engine) {
+  const map = { deepgram: 'Deepgram' };
+  return map[engine] ?? engine;
+}
+describe('engineLabel handles modern engine names', () => {
+  it('maps deepgram', () => { expect(engineLabel('deepgram')).toBe('Deepgram'); });
+});`;
+  assert.ok(rules('test/stability.test.ts', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: importing the real implementation by PACKAGE NAME is not a confession', () => {
+  // The monorepo shape the old relative-import guard could not see.
+  const src = `import { engineLabel } from "@app/core";
+describe('engineLabel', () => {
+  it('maps', () => { expect(engineLabel('deepgram')).toBe('Deepgram'); });
+});`;
+  assert.ok(!rules('packages/core/__tests__/engineLabel.test.ts', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: prose in a comment is not a confession without a code target', () => {
+  // vite/vue shapes: "duplicate exports are removed (in", "mirrors the dev-server order in"
+  const a = `// duplicate exports are removed (in the output bundle)
+import { build } from "vite";`;
+  const b = `// mirrors the dev-server order in practice
+import { createServer } from "vite";`;
+  assert.ok(!rules('packages/vite/src/node/__tests__/x.spec.ts', a).includes('TAUTOLOGY'));
+  assert.ok(!rules('packages/vite/src/node/__tests__/y.spec.ts', b).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: a confession naming a real code target still fires', () => {
+  const src = `// mirrors generateSignature() in payfast.ts — keep in lockstep
+function generateSignature(d) { return md5(d); }`;
+  assert.ok(rules('test/payfast.test.ts', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: a lowercase helper matching PROSE in a title is NOT flagged', () => {
+  // zod to-json-schema.test.ts shape: `required` is a local arrow helper, and the
+  // titles say "adds required" / "stays required" as ordinary English.
+  const src = `import { z } from "zod";
+const required = (schema) => Object.keys(schema.shape);
+test("record with enum keys adds required", () => {
+  expect(required(z.object({}))).toEqual([]);
+});`;
+  assert.ok(!rules('packages/zod/tests/to-json-schema.test.ts', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: lowercase name written as a CALL in the title IS flagged', () => {
+  // trpc errors.test.ts shape: `test('getMessageFromUnknownError()')` — the title
+  // names it as a function, which is a subject declaration, not prose.
+  const src = `import { isObject } from "@trpc/server";
+function unwrap(err, fallback) { return typeof err === 'string' ? err : fallback; }
+test('unwrap()', () => {
+  expect(unwrap('a', 'b')).toBe('a');
+});`;
+  assert.ok(rules('packages/tests/server/errors.test.ts', src).includes('TAUTOLOGY'));
 });

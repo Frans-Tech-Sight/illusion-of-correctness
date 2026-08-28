@@ -1,6 +1,6 @@
 {
   "name": "illusion-of-correctness",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Find the defects that survive a green test suite: gates that fail open, tests that measure their own copy, background writes that never land.",
   "keywords": [
     "static-analysis",
