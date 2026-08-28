@@ -38,10 +38,75 @@ export const RULES = {
   },
   SILENT_SWALLOW: {
     severity: 'low',
-    title: 'Error discarded with no record',
-    why: 'An empty catch makes the failure unobservable. If it is deliberate, say so in a comment and this rule will stand down.',
+    title: 'Error discarded with no record in a path that moves money or access',
+    why: 'An empty catch in payment, auth or notification code makes the failure unobservable — the incident class where a dead email path or a skipped credit stays invisible for months. Bare `catch {}`, `_`-prefixed bindings, and any catch body carrying a comment are respected as deliberate decisions.',
   },
 };
+
+/**
+ * Where a silently swallowed error is dangerous enough to flag. Precision over
+ * recall, measured 2026-08-28: an unrestricted empty-catch rule produced 46
+ * findings across eight well-known repos, and every hand-checked one was a
+ * deliberate ignore (feature detection, `_err` convention, catch-as-assertion
+ * in tests). A correctness tool that cries wolf on famous code refutes itself,
+ * so this rule now fires only where the post-mortems it came from lived:
+ * money, entitlement, and outbound-notification paths.
+ */
+const SWALLOW_CONTEXT =
+  /(payment|payout|refund|credit|debit|charge|billing|invoice|itn|webhook|notif|email|mail|sms|auth|entitle|balance|quota|licen[cs]e|subscri|paywall)/i;
+
+/**
+ * Catch bindings that already SAY "ignored on purpose": no binding at all
+ * (`catch {`), or an `_`-prefixed name (`catch (_err)`) — both ecosystem
+ * conventions. Flagging them is noise, and noise gets a checker uninstalled.
+ */
+function catchBindingIsDeliberate(line) {
+  const m = /catch\s*(?:\(\s*([A-Za-z_$][\w$]*)?[^)]*\))?\s*\{/.exec(line);
+  if (!m) return false;
+  const binding = m[1];
+  if (!binding) return true;          // bare catch — deliberate by convention
+  return binding.startsWith('_');     // _err / _ — deliberate by convention
+}
+
+/**
+ * Blank out the CONTENTS of string and template literals so patterns never
+ * match inside them, while preserving line length (line numbers and snippets
+ * stay true). Tracks multi-line template literals across calls via `state`.
+ * Measured failure this fixes: webpack CssLoadingRuntimeModule.js embeds
+ * runtime JS in a string — `catch(e) {}` inside it was reported as a finding
+ * in webpack's own source. It is not webpack's source; it is a string.
+ */
+export function stripStringLiterals(line, state = { inTemplate: false }, opts = {}) {
+  let out = '';
+  let i = 0;
+  let mode = state.inTemplate ? '`' : null; // null | "'" | '"' | '`'
+  while (i < line.length) {
+    const c = line[i];
+    if (mode) {
+      if (c === '\\') { out += '  '; i += 2; continue; }
+      if (c === mode) { out += c; mode = null; i++; continue; }
+      out += ' ';
+      i++;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') { mode = c; out += c; i++; continue; }
+    // line comment: keep the marker, blank the text — comments sometimes QUOTE
+    // buggy code (`catch {}` in an explanation) and must never match as code.
+    // The raw line, not this sanitized copy, is what the comment-aware logic
+    // (DELIBERATE, ignore directives) reads. With keepComments, comment text
+    // survives — the TAUTOLOGY mirror scan needs comments ("mirrors X in Y")
+    // while still ignoring string literals (test TITLES are strings).
+    if (c === '/' && line[i + 1] === '/') {
+      out += opts.keepComments ? line.slice(i) : '//' + ' '.repeat(Math.max(0, line.length - i - 2));
+      break;
+    }
+    out += c;
+    i++;
+  }
+  // ' and " do not span lines; only a template literal carries over
+  state.inTemplate = mode === '`';
+  return out;
+}
 
 const isTestPath = (file) => {
   const p = String(file).replace(/\\/g, '/');
@@ -62,55 +127,84 @@ export function analyse(file, src) {
   const push = (rule, line, snippet) =>
     out.push({ rule, file, line, snippet: String(snippet).trim().slice(0, 160) });
 
+  // One pass to sanitize every line: string/template contents blanked, comment
+  // text blanked, line numbers preserved. Patterns match ONLY sanitized code;
+  // raw lines are kept for snippets and for the comment-reading logic.
+  const stripState = { inTemplate: false };
+  const code = lines.map((l) => stripStringLiterals(l, stripState));
+
   for (let i = 0; i < lines.length; i++) {
-    const L = lines[i];
+    const L = lines[i];        // raw — snippets, DELIBERATE, ignore directives
+    const C = code[i];         // sanitized — all structural pattern matching
     const ln = i + 1;
     if (IGNORE_DIRECTIVE.test(L) || (i > 0 && IGNORE_DIRECTIVE.test(lines[i - 1]))) continue;
 
     // NULLISH_CMP — unparenthesised `?? n <cmp>`
-    if (/\?\?\s*-?\d+(?:\.\d+)?\s*(?:>=|<=|>|<)(?!=)/.test(L)) push('NULLISH_CMP', ln, L);
+    if (/\?\?\s*-?\d+(?:\.\d+)?\s*(?:>=|<=|>|<)(?!=)/.test(C)) push('NULLISH_CMP', ln, L);
 
-    // SILENT_SWALLOW — empty catch, or a catch whose body is only comments
-    if (/catch\s*(?:\([^)]*\))?\s*\{\s*\}/.test(L)) {
-      if (!DELIBERATE.test(L)) push('SILENT_SWALLOW', ln, L);
-    } else if (/catch\s*(?:\([^)]*\))?\s*\{\s*$/.test(L)) {
-      let j = i + 1, onlyComments = true, closed = false, deliberate = false;
-      for (; j < lines.length && j < i + 10; j++) {
-        const t = lines[j].trim();
-        if (t === '}') { closed = true; break; }
-        if (DELIBERATE.test(t)) deliberate = true;
-        if (t && !t.startsWith('//') && !t.startsWith('/*') && !t.startsWith('*')) { onlyComments = false; break; }
+    // SILENT_SWALLOW — empty catch, or a catch whose body is only comments.
+    // Precision constraints (2026-08-28 sweep): never in test files (a catch is
+    // often the assertion there), never for bare/`_`-prefixed bindings (the
+    // deliberate-ignore conventions), and only in money/access/notification
+    // context — the incident class this rule was distilled from.
+    if (!test && !catchBindingIsDeliberate(C)) {
+      const swallowCtx = lines.slice(Math.max(0, i - 25), i + 3).join('\n');
+      if (SWALLOW_CONTEXT.test(swallowCtx)) {
+        if (/catch\s*(?:\([^)]*\))?\s*\{\s*\}/.test(C)) {
+          if (!DELIBERATE.test(L)) push('SILENT_SWALLOW', ln, L);
+        } else if (/catch\s*(?:\([^)]*\))?\s*\{\s*$/.test(C)) {
+          // Multi-line catch: flag only a body that is completely EMPTY. A body
+          // containing any comment at all is a documented decision — axios's
+          // "// ignore malformed URL: leaving auth stripped is fail-safe" is an
+          // explanation, and demanding OUR magic words instead of accepting
+          // theirs is how a checker becomes noise (2026-08-28 sweep).
+          let j = i + 1, empty = true, closed = false;
+          for (; j < lines.length && j < i + 10; j++) {
+            const t = lines[j].trim();
+            if (t === '}') { closed = true; break; }
+            if (t) { empty = false; break; }
+          }
+          if (closed && empty) push('SILENT_SWALLOW', ln, L);
+        }
       }
-      if (closed && onlyComments && !deliberate) push('SILENT_SWALLOW', ln, L);
     }
 
     // LOST_ASYNC — `void asyncThing(...)` with a response sent shortly after
-    if (/^\s*void\s+[A-Za-z_$][\w$.]*\s*\(/.test(L)) {
-      const ahead = lines.slice(i, Math.min(i + 12, lines.length)).join('\n');
+    if (/^\s*void\s+[A-Za-z_$][\w$.]*\s*\(/.test(C)) {
+      const ahead = code.slice(i, Math.min(i + 12, code.length)).join('\n');
       if (/return\s+res\.|res\.(?:json|send|end|status)\s*\(|return\s+new\s+Response|return\s+Response\./.test(ahead)) {
         push('LOST_ASYNC', ln, L);
       }
     }
 
     if (!test) {
+      // Context is read RAW on purpose: a comment saying "balance gate" is a
+      // legitimate scoping signal. Only the defect PATTERNS use sanitized code.
       const ctx = lines.slice(Math.max(0, i - 25), i + 3).join('\n');
+      const ctxCode = code.slice(Math.max(0, i - 25), i + 3).join('\n');
 
       // FAIL_OPEN — `if (err) return <permissive>` inside a gate
-      if (/if\s*\(\s*!?\s*(?:\w*[Ee]rr\w*|error)\b[^)]*\)\s*\{?\s*return\s+(?:null|true|undefined)\s*;?/.test(L) && GATE_WORDS.test(ctx)) {
+      if (/if\s*\(\s*!?\s*(?:\w*[Ee]rr\w*|error)\b[^)]*\)\s*\{?\s*return\s+(?:null|true|undefined)\s*;?/.test(C) && GATE_WORDS.test(ctx)) {
         push('FAIL_OPEN', ln, L);
       }
       // FAIL_OPEN — missing record treated as authorised, right after a lookup
-      if (/if\s*\(\s*!\s*(?:data|profile|row|record|user|account|sub\w*)\s*\)\s*\{?\s*return\s+(?:null|true)\s*;?/.test(L)
+      if (/if\s*\(\s*!\s*(?:data|profile|row|record|user|account|sub\w*)\s*\)\s*\{?\s*return\s+(?:null|true)\s*;?/.test(C)
         && GATE_WORDS.test(ctx)
-        && /\.(?:select|from|single|maybeSingle|findOne|findUnique|get)\s*\(/.test(ctx)) {
+        && /\.(?:select|from|single|maybeSingle|findOne|findUnique|get)\s*\(/.test(ctxCode)) {
         push('FAIL_OPEN', ln, L);
       }
     }
   }
 
-  // TAUTOLOGY — a test that mirrors production logic instead of importing it
+  // TAUTOLOGY — a test that mirrors production logic instead of importing it.
+  // The mirror scan runs on string-stripped text with comments KEPT: the honest
+  // confession ("mirrors generateSignature() in payfast.ts") lives in comments,
+  // while test TITLES are string literals — got's 'no duplicate hook calls in
+  // single-page paginated requests' matched the old raw-source scan.
   if (test) {
-    const mirror = /\b(?:mirrors?|mirroring|re-?implement\w*|duplicat\w+|(?:local |inline )?copy of|same logic as)\b[^\n]{0,80}?(?:\bin\b|\bfrom\b|\.[tj]sx?\b)/i.exec(src);
+    const st = { inTemplate: false };
+    const srcNoStrings = lines.map((l) => stripStringLiterals(l, st, { keepComments: true })).join('\n');
+    const mirror = /\b(?:mirrors?|mirroring|re-?implement\w*|duplicat\w+|(?:local |inline )?copy of|same logic as)\b[^\n]{0,80}?(?:\bin\b|\bfrom\b|\.[tj]sx?\b)/i.exec(srcNoStrings);
     if (mirror && !IGNORE_DIRECTIVE.test(src)) {
       push('TAUTOLOGY', src.slice(0, mirror.index).split('\n').length, mirror[0]);
     }
