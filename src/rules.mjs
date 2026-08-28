@@ -204,22 +204,59 @@ export function analyse(file, src) {
   if (test) {
     const st = { inTemplate: false };
     const srcNoStrings = lines.map((l) => stripStringLiterals(l, st, { keepComments: true })).join('\n');
-    const mirror = /\b(?:mirrors?|mirroring|re-?implement\w*|duplicat\w+|(?:local |inline )?copy of|same logic as)\b[^\n]{0,80}?(?:\bin\b|\bfrom\b|\.[tj]sx?\b)/i.exec(srcNoStrings);
+    // A confession must name a CODE target — `checkBalance()` or `payfast.ts`.
+    // Requiring only a following "in"/"from" matched ordinary prose in real test
+    // titles and comments: "duplicate exports are removed (in" (vite),
+    // "mirrors the dev-server order in" (vue). Neither is a re-implementation.
+    const mirror = /\b(?:mirrors?|mirroring|re-?implements?|duplicates?|(?:local |inline )?copy of|same logic as)\b[^\n]{0,60}?(?:[A-Za-z_$][\w$]*\s*\(\s*\)|[\w./-]+\.[tj]sx?\b)/i.exec(srcNoStrings);
     if (mirror && !IGNORE_DIRECTIVE.test(src)) {
       push('TAUTOLOGY', src.slice(0, mirror.index).split('\n').length, mirror[0]);
     }
-    // A locally defined function is only suspicious when the suite imports NOTHING from
-    // source. If the real module is imported, local functions are ordinary test helpers —
-    // flagging those is how a checker becomes noise and gets switched off.
-    const importsSource = /import[^;]*from\s*['"](?:\.\.?\/)[^'"]*['"]/.test(src);
-    if (!importsSource) {
-      for (const m of src.matchAll(/^[ \t]*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)) {
-        const fn = m[1];
-        const described = new RegExp(`(?:describe|it|test)\\s*\\(\\s*['"\`][^'"\`]*\\b${fn}\\b`, 'i');
-        if (described.test(src)) {
-          push('TAUTOLOGY', src.slice(0, m.index).split('\n').length, `function ${fn}(...)`);
-        }
-      }
+
+    // A local definition is a TAUTOLOGY only when the suite ASSERTS ON IT while
+    // claiming to test it. Two signals must coincide:
+    //   (a) the function is called directly inside an assertion —
+    //       `expect(engineLabel(x))`, not `<Parent />`;
+    //   (b) its name appears in a describe/it title, i.e. the suite says this is
+    //       the subject under test, not a helper.
+    //
+    // The previous heuristic — "flag any local function named in a title when the
+    // file imports nothing RELATIVE" — produced 12 findings across 5 monorepos on
+    // 2026-08-28, every one a false positive. Monorepo tests import their own
+    // package by NAME (`from "react-router"`), so the relative-import guard read
+    // "imports nothing", and React fixture components (`function Parent()`) plus
+    // ordinary helpers (`shuffle`, `bundle`, `request`) were all flagged.
+    const localFns = new Set();
+    for (const m of srcNoStrings.matchAll(/^[ \t]*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)) {
+      localFns.add(m[1]);
+    }
+    for (const m of srcNoStrings.matchAll(/^[ \t]*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/gm)) {
+      localFns.add(m[1]);
+    }
+
+    for (const fn of localFns) {
+      // (a) asserted upon directly
+      const asserted = new RegExp(
+        `(?:expect|assert(?:\\.[\\w$]+)?|t\\.[\\w$]+|should)\\s*\\(\\s*(?:await\\s+)?${fn}\\s*\\(`,
+      ).test(srcNoStrings);
+      if (!asserted) continue;
+
+      // (b) declared as the SUBJECT in a title — and the name must actually
+      // identify something. A bare lowercase word matches ordinary English prose:
+      // vue's `test('ts module resolve')` and zod's `test('...adds required')`
+      // both matched local helpers named `resolve` and `required` and produced
+      // false positives (2026-08-28). Accept a title reference only when the name
+      // is a distinctive identifier (camelCase / underscore / leading capital) or
+      // is written as a call — `getMessageFromUnknownError()`.
+      const looksLikeIdentifier = /[A-Z_]/.test(fn);
+      const titleWord = new RegExp(`(?:describe|it|test)\\s*\\(\\s*['"\`][^'"\`]*\\b${fn}\\b`, 'i');
+      const titleCall = new RegExp(`(?:describe|it|test)\\s*\\(\\s*['"\`][^'"\`]*\\b${fn}\\s*\\(`, 'i');
+      const described = titleCall.test(src) || (looksLikeIdentifier && titleWord.test(src));
+      if (!described) continue;
+
+      const decl = new RegExp(`^[ \\t]*(?:export\\s+)?(?:async\\s+)?(?:function\\s+${fn}\\b|(?:const|let|var)\\s+${fn}\\s*=)`, 'm');
+      const at = decl.exec(srcNoStrings);
+      if (at) push('TAUTOLOGY', srcNoStrings.slice(0, at.index).split('\n').length, `${fn}(...) defined locally and asserted upon`);
     }
   }
 
