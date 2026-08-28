@@ -108,22 +108,92 @@ describe('computeVerdict', () => { it('works', () => {}); });`;
 });
 
 // ── SILENT_SWALLOW ────────────────────────────────────────────────────────────
-test('SILENT_SWALLOW: empty catch is flagged', () => {
-  assert.ok(rules('a.ts', 'try { risky(); } catch {}').includes('SILENT_SWALLOW'));
+// Contract since 0.2.0, driven by the 2026-08-28 precision sweep: an
+// unrestricted empty-catch rule produced 46 findings on eight famous repos and
+// every hand-checked one was deliberate. The rule now fires only for a NAMED,
+// non-underscore binding, outside test files, in money/access/notification
+// context — the incident class it was distilled from.
+
+test('SILENT_SWALLOW: named empty catch in a payment path is flagged', () => {
+  const src = `async function confirmPayment(id) {
+  try { await sendPaymentConfirmed(id); } catch (e) {}
+}`;
+  assert.ok(rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
 });
 
-test('SILENT_SWALLOW: a stated-deliberate swallow stands down', () => {
-  const src = `try { risky(); } catch {
+test('SILENT_SWALLOW: bare catch {} is the deliberate-ignore idiom — NOT flagged', () => {
+  const src = `async function confirmPayment(id) {
+  try { await sendPaymentConfirmed(id); } catch {}
+}`;
+  assert.ok(!rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
+});
+
+test('SILENT_SWALLOW: _-prefixed binding is the deliberate-ignore idiom — NOT flagged', () => {
+  const src = `async function confirmPayment(id) {
+  try { await sendPaymentConfirmed(id); } catch (_err) {}
+}`;
+  assert.ok(!rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
+});
+
+test('SILENT_SWALLOW: empty catch OUTSIDE money/access context is NOT flagged', () => {
+  // Feature detection, optional niceties — the shape that made famous repos
+  // light up. Out of scope by design.
+  const src = `function supportsColour() {
+  try { probeTerminal(); } catch (e) {}
+}`;
+  assert.ok(!rules('lib/tty.ts', src).includes('SILENT_SWALLOW'));
+});
+
+test('SILENT_SWALLOW: never reported from test files (catch can BE the assertion)', () => {
+  const src = `it('rejects bad payment input', () => {
+  try { chargePayment(null); } catch (e) { hit = true; }
+});
+try { chargePayment(null); } catch (e) {}`;
+  assert.ok(!rules('test/billing.test.ts', src).includes('SILENT_SWALLOW'));
+});
+
+test('SILENT_SWALLOW: a stated-deliberate swallow stands down even in context', () => {
+  const src = `try { await sendPaymentConfirmed(id); } catch (e) {
     // Fire-and-forget: never propagate errors to the caller.
   }`;
-  assert.ok(!rules('lib/logger.ts', src).includes('SILENT_SWALLOW'));
+  assert.ok(!rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
 });
 
 test('SILENT_SWALLOW: catch that handles the error is NOT flagged', () => {
-  const src = `try { risky(); } catch (e) {
+  const src = `try { await sendPaymentConfirmed(id); } catch (e) {
     report(e);
   }`;
-  assert.ok(!rules('a.ts', src).includes('SILENT_SWALLOW'));
+  assert.ok(!rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
+});
+
+// ── string-literal immunity (webpack CssLoadingRuntimeModule regression) ──────
+// The scanner once reported `catch(e) {}` INSIDE a string of embedded runtime
+// JS as a finding in the host file. Code in strings is data, not code.
+
+test('STRINGS: catch inside a double-quoted string is NOT a finding', () => {
+  const src = `const runtime = "try { load(); } catch(e) {} // payment retry";
+async function chargePayment() {}`;
+  assert.ok(!rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
+});
+
+test('STRINGS: pattern inside a multi-line template literal is NOT a finding', () => {
+  const src = 'const snippet = `\n' +
+    'balance example: if (x ?? 0 > 0) { pay(); }\n' +
+    'try { charge(); } catch (e) {}\n' +
+    '`;\nexport function billing() {}';
+  const found = rules('lib/billing.ts', src);
+  assert.ok(!found.includes('NULLISH_CMP'));
+  assert.ok(!found.includes('SILENT_SWALLOW'));
+});
+
+test('STRINGS: real code AFTER a closed template literal is still scanned', () => {
+  const src = 'const s = `harmless`;\nconst v = x ?? 0 > 0;';
+  assert.ok(rules('a.ts', src).includes('NULLISH_CMP'));
+});
+
+test('STRINGS: quoted code inside a line comment is NOT a finding', () => {
+  const src = '// bad shape: try { f(); } catch (e) {}  seen in a payment path once\nexport function billing() {}';
+  assert.ok(!rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
 });
 
 // ── suppression + hygiene ─────────────────────────────────────────────────────
@@ -162,4 +232,41 @@ test('SAFETY: rules module performs no I/O and opens no network connections', as
   for (const forbidden of ['node:fs', 'node:net', 'node:http', 'node:https', 'node:child_process', 'fetch(', 'XMLHttpRequest', 'require(']) {
     assert.ok(!src.includes(forbidden), `rules.mjs must not reference ${forbidden}`);
   }
+});
+
+// ── precision regressions from the 2026-08-28 famous-repo sweep, round 2 ──────
+
+test('SILENT_SWALLOW: a catch body with ANY comment is a documented decision — NOT flagged', () => {
+  // axios lib/adapters/http.js shape: explanation in the developer's own words,
+  // not our magic phrases. Demanding our words instead of accepting theirs is noise.
+  const src = `options.beforeRedirects.auth = function beforeRedirectAuth(redirectOptions) {
+  try {
+    redirectOptions.auth = authToRestore;
+  } catch (e) {
+    // ignore malformed URL: leaving auth stripped is fail-safe
+  }
+};`;
+  assert.ok(!rules('lib/http.js', src).includes('SILENT_SWALLOW'));
+});
+
+test('SILENT_SWALLOW: a completely EMPTY multi-line catch in context IS flagged', () => {
+  const src = `try { await sendPaymentConfirmed(id); } catch (e) {
+}`;
+  assert.ok(rules('lib/billing.ts', src).includes('SILENT_SWALLOW'));
+});
+
+test('TAUTOLOGY: a test TITLE containing "duplicate ... in" is a string — NOT flagged', () => {
+  // got test/hooks.ts shape: the title is prose in a string literal, not a
+  // confession of re-implementing production code.
+  const src = `import got from '../source/index.js';
+test('no duplicate hook calls in single-page paginated requests', async (t) => {
+  t.pass();
+});`;
+  assert.ok(!rules('test/hooks.test.ts', src).includes('TAUTOLOGY'));
+});
+
+test('TAUTOLOGY: a mirror confession in a COMMENT still fires after string-stripping', () => {
+  const src = `// mirrors generateSignature() in payfast.ts — keep in lockstep
+function generateSignature(d) { return md5(d); }`;
+  assert.ok(rules('test/payfast.test.ts', src).includes('TAUTOLOGY'));
 });
